@@ -516,7 +516,7 @@ function sqlitevalue(::Type{T}, handle, col) where {T}
     r = sqldeserialize(buf)
     return r
 end
-# Handle Union{} type (when SQLite can't infer type from all-NULL columns)
+# Handle Union{} type (when SQLite can't infer type from all-NULL columns) by returning missing
 sqlitevalue(::Type{Union{}}, handle, col) = missing
 
 # conversion from Julia to SQLite3 types
