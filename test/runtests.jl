@@ -300,6 +300,44 @@ end
         end
     end
 
+    @testset "Issue #341: load! inside transaction" begin
+        db = SQLite.DB()
+        # Test that load! works when called inside an existing transaction
+        data = [(a=1, b="x"), (a=2, b="y"), (a=3, b="z")]
+
+        # First verify load! works outside a transaction
+        SQLite.load!(data, db, "test_outside")
+        result = DBInterface.execute(db, "SELECT * FROM test_outside") |> columntable
+        @test result.a == [1, 2, 3]
+        @test result.b == ["x", "y", "z"]
+
+        # Now test load! inside a transaction (this is what issue #341 reported as failing)
+        DBInterface.transaction(db) do
+            data2 = [(c=10, d="hello"), (c=20, d="world")]
+            SQLite.load!(data2, db, "test_inside")
+        end
+        result2 = DBInterface.execute(db, "SELECT * FROM test_inside") |> columntable
+        @test result2.c == [10, 20]
+        @test result2.d == ["hello", "world"]
+
+        # Test nested transaction with rollback
+        DBInterface.transaction(db) do
+            data3 = [(e=100,)]
+            SQLite.load!(data3, db, "test_rollback")
+            # This table should exist within the transaction
+            @test DBInterface.execute(db, "SELECT * FROM test_rollback") |> columntable |> x -> x.e == [100]
+        end
+        # Table should still exist after commit
+        @test DBInterface.execute(db, "SELECT * FROM test_rollback") |> columntable |> x -> x.e == [100]
+
+        # Test intransaction helper
+        @test SQLite.intransaction(db) == false
+        SQLite.transaction(db)
+        @test SQLite.intransaction(db) == true
+        SQLite.commit(db)
+        @test SQLite.intransaction(db) == false
+    end
+
     @testset "Dates" begin
         setup_clean_test_db() do db
             DBInterface.execute(db, "create table temp as select * from album")
@@ -799,6 +837,18 @@ end
         @test_throws SQLiteException SQLite.load!(tbl3, db, "data")
     end
 
+    @testset "PR #343: strict (and only strict) tables should error if types don't match" begin
+        db = SQLite.DB()
+
+        tbl1 = (a = [1, 2, 3], b = [4, 5, 6])
+        SQLite.load!(tbl1, db, "data_default")
+        SQLite.load!(tbl1, db, "data_strict", strict=true)
+        
+        tbl2 = (a = ["a", "b", "c"], b=[7, 8, 9])
+        SQLite.load!(tbl2, db, "data_default")
+        @test_throws SQLiteException SQLite.load!(tbl2, db, "data_strict")
+    end
+
     @testset "Test busy_timeout" begin
         db = SQLite.DB()
         @test SQLite.busy_timeout(db, 300) == 0
@@ -1016,6 +1066,49 @@ end
     DBInterface.execute(db, "insert into tmp values (?)", (:a,))
     tbl = DBInterface.execute(db, "select x from tmp") |> columntable
     @test isequal(tbl.x, [missing, :a])
+
+    # Symbol in TEXT type doesn't work
+    # when strict and first row is NULL (the serialized bytes are interpreted as a string)
+    tbl =
+        DBInterface.execute(
+            DBInterface.prepare(db, "select x from tmp"),
+            ();
+            strict = true,
+        ) |> columntable
+    @test tbl.x[1] === missing
+    @test tbl.x[2] isa String  # Symbol gets incorrectly deserialized as garbage string
+
+    # Symbol in BLOB type does work strict
+    db = SQLite.DB()
+    DBInterface.execute(db, "create table tmp ( x BLOB )")
+    DBInterface.execute(db, "insert into tmp values (?)", (nothing,))
+    DBInterface.execute(db, "insert into tmp values (?)", (:a,))
+    tbl = DBInterface.execute(db, "select x from tmp") |> columntable
+    @test isequal(tbl.x, [missing, :a])
+
+    tbl =
+        DBInterface.execute(
+            DBInterface.prepare(db, "select x from tmp"),
+            ();
+            strict = true,
+        ) |> columntable
+    @test isequal(tbl.x, [missing, :a])
+
+    # Symbol in TEXT always works when first row is not NULL
+    db = SQLite.DB()
+    DBInterface.execute(db, "create table tmp ( x TEXT )")
+    DBInterface.execute(db, "insert into tmp values (?)", (:a,))
+    DBInterface.execute(db, "insert into tmp values (?)", (nothing,))
+    tbl = DBInterface.execute(db, "select x from tmp") |> columntable
+    @test isequal(tbl.x, [:a, missing])
+
+    tbl =
+        DBInterface.execute(
+            DBInterface.prepare(db, "select x from tmp"),
+            ();
+            strict = true,
+        ) |> columntable
+    @test isequal(tbl.x, [:a, missing])
 
     db = SQLite.DB()
     DBInterface.execute(

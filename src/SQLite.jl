@@ -82,6 +82,14 @@ Base.close(db::DB) = _close_db!(db)
 Base.isopen(db::DB) = isopen(db.handle)
 Base.isopen(handle::DBHandle) = handle != C_NULL
 
+"""
+    SQLite.intransaction(db::DB) -> Bool
+
+Check if the database connection is currently in a transaction.
+Returns `true` if in a transaction, `false` if in autocommit mode.
+"""
+intransaction(db::DB) = C.sqlite3_get_autocommit(db.handle) == 0
+
 function finalize_statements!(db::DB)
     # close stmts
     for stmt_wrapper in keys(db.stmt_wrappers)
@@ -157,7 +165,7 @@ mutable struct Stmt <: DBInterface.Statement
     end
 end
 
-_get_stmt_handle(stmt::Stmt) = stmt.stmt_wrapper[]
+_get_stmt_handle(stmt::Stmt)::StmtHandle = stmt.stmt_wrapper[]
 function _set_stmt_handle(stmt::Stmt, handle)
     stmt.stmt_wrapper[] = handle
 end
@@ -497,15 +505,15 @@ function sqlitevalue(
     ::Type{T},
     handle,
     col,
-) where {T<:Union{Base.BitSigned,Base.BitUnsigned}}
+)::T where {T<:Union{Base.BitSigned,Base.BitUnsigned}}
     convert(T, C.sqlite3_column_int64(handle, col - 1))
 end
 const FLOAT_TYPES = Union{Float16,Float32,Float64} # exclude BigFloat
-function sqlitevalue(::Type{T}, handle, col) where {T<:FLOAT_TYPES}
+function sqlitevalue(::Type{T}, handle, col)::T where {T<:FLOAT_TYPES}
     convert(T, C.sqlite3_column_double(handle, col - 1))
 end
 #TODO: test returning a WeakRefString instead of calling `unsafe_string`
-function sqlitevalue(::Type{T}, handle, col) where {T<:AbstractString}
+function sqlitevalue(::Type{T}, handle, col)::T where {T<:AbstractString}
     convert(T, unsafe_string(C.sqlite3_column_text(handle, col - 1)))
 end
 function sqlitevalue(::Type{T}, handle, col) where {T}
@@ -652,9 +660,16 @@ In the second method, `func` is executed within a transaction (the transaction b
 function transaction end
 
 function transaction(db::DB, mode = "DEFERRED")
-    execute(db, "PRAGMA temp_store=MEMORY;")
+    already_in_transaction = intransaction(db)
+    # PRAGMA statements cannot be executed inside a transaction
+    already_in_transaction || execute(db, "PRAGMA temp_store=MEMORY;")
     if uppercase(mode) in ["", "DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
-        execute(db, "BEGIN $(mode) TRANSACTION;")
+        if already_in_transaction
+            # If already in a transaction, use a savepoint instead
+            execute(db, "SAVEPOINT $(mode);")
+        else
+            execute(db, "BEGIN $(mode) TRANSACTION;")
+        end
     else
         execute(db, "SAVEPOINT $(mode);")
     end
@@ -665,7 +680,9 @@ DBInterface.transaction(f, db::DB) = transaction(f, db)
 @inline function transaction(f::Function, db::DB)
     # generate a random name for the savepoint
     name = string("SQLITE", Random.randstring(10))
-    execute(db, "PRAGMA synchronous = OFF;")
+    already_in_transaction = intransaction(db)
+    # PRAGMA statements cannot be executed inside a transaction
+    already_in_transaction || execute(db, "PRAGMA synchronous = OFF;")
     transaction(db, name)
     try
         f()
@@ -675,7 +692,7 @@ DBInterface.transaction(f, db::DB) = transaction(f, db)
     finally
         # savepoints are not released on rollback
         commit(db, name)
-        execute(db, "PRAGMA synchronous = ON;")
+        already_in_transaction || execute(db, "PRAGMA synchronous = ON;")
     end
 end
 
