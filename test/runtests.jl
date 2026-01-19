@@ -1137,4 +1137,21 @@ end
         db_b,
         "select myfunc(1) as x",
     )
+
+    # Test all NULL column (Union{} type)
+    # https://github.com/Deltares/Ribasim/issues/2800
+    @testset "All NULL column (Union{} type)" begin
+        db = SQLite.DB()
+        DBInterface.execute(db, "CREATE TABLE allnulls (id INTEGER, empty_col TEXT)")
+        DBInterface.execute(db, "INSERT INTO allnulls VALUES (1, NULL)")
+        DBInterface.execute(db, "INSERT INTO allnulls VALUES (2, NULL)")
+        DBInterface.execute(db, "INSERT INTO allnulls VALUES (3, NULL)")
+        
+        # Query with strict=true to use SQLite's type inference
+        r = DBInterface.execute(db, "SELECT * FROM allnulls"; strict=true) |> columntable
+        @test r.id == [1, 2, 3]
+        @test all(ismissing, r.empty_col)
+        
+        DBInterface.close!(db)
+    end
 end
